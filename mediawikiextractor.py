@@ -37,7 +37,7 @@ def load_config(config_path: str) -> dict:
     for content_type, keys in {str: ["source"],
                                bool: ["table_fix", "excludeExistingPages"],
                                list: ["output_format", "page_titles", "categories", "exclude_categories",
-                                      "exclude_titles", "cleaning_rule"]}.items():
+                                      "exclude_titles"]}.items():
         for key in keys:
             if key not in config or not isinstance(config[key], content_type):
                 logging.error(f"配置文件格式错误，关键字：{key}缺失或类型错误")
@@ -100,30 +100,41 @@ def process_category(config: dict) -> list[str]:
                 page_html = request_page(index_url, {"title": f"Category:{category}"})
             else:
                 page_html = request_page(nextpage_url)
+
             if page_html == 404:
                 logging.error(f"未找到 {category} 分类")
                 success = False
                 break
+
             soup = BeautifulSoup(page_html, "lxml")
             nextpage_url = None
+
+            # 提取分类下的页面
             mw_categories = soup.find_all("div", "mw-category")
             for mw_category in mw_categories:
                 for li in mw_category.find_all("li"):
                     a = li.find("a")
                     if a and "title" in a.attrs:
                         if a.attrs["title"].startswith("Category:"):
-                            if a.attrs["title"].replace("Category:", "") not in categories:
-                                categories.append(a.attrs["title"].replace("Category:", ""))
+                            subcat = a.attrs["title"].replace("Category:", "")
+                            if subcat not in categories:
+                                categories.append(subcat)
                         else:
                             page_titles.append(a.attrs["title"])
-            for a in soup.find_all("a"):
-                if (a.attrs.get("title") == f"Category:{category}"
-                        and "pagefrom" in a.attrs.get("href", "")):
-                    nextpage_url = f"https://{site_domain}{a['href']}"
-                    break
+
+            # 查找下一页链接
+            nav_div = soup.find("div", id="mw-pages")
+            if nav_div:
+                for a in nav_div.find_all("a"):
+                    href = a.get("href", "")
+                    if "pagefrom=" in href:
+                        nextpage_url = f"https://{site_domain}{href}"
+                        break
+
             if nextpage_url is None:
                 success = True
                 break
+
         if success:
             logging.info(f"[{i + 1}/{len(categories)}]获取 {category} 分类的页面列表成功")
         i += 1
@@ -319,11 +330,6 @@ def process_html(text: str, config: dict, output_format: str) -> str:
 
     text = format_conversion(html, output_format, config)
 
-    # 清理文本
-    clear_pattern = re.compile("|".join(config["cleaning_rule"]), flags=re.DOTALL)
-    return re.sub(clear_pattern, "", text, count=0)
-
-
 def main(args: argparse.Namespace) -> int:
     """
     :param args: 参数
@@ -367,50 +373,52 @@ def main(args: argparse.Namespace) -> int:
             logging.exception(f"处理页面 {page_title} 时发生错误")
             continue
 
+
 def process_page(page_title: str, config: dict, data: list[dict], page_titles: list[str], i: int,
-                     start_process_page_time: float, output_path: str) -> None:
-        index_url = random.choice(config["index_url"])
-        logging.info(
-            f"[{i + 1}/{len(page_titles)}]正在处理页面：{page_title}  ({(time.time() - start_process_page_time) / 60:.2f}分钟/页)")
+                 start_process_page_time: float, output_path: str) -> None:
+    index_url = random.choice(config["index_url"])
+    logging.info(
+        f"[{i + 1}/{len(page_titles)}]正在处理页面：{page_title}  ({(time.time() - start_process_page_time) / 60:.2f}分钟/页)")
 
-        page_dict = {"title": page_title, "source": config["source"]}
+    page_dict = {"title": page_title, "source": config["source"]}
 
-        # 排除已存在的页面
-        same_title_item = [item for item in data if item["title"] == page_title and item["source"] == config["source"]]
-        if config.get("excludeExistingPages") and same_title_item:
+    # 排除已存在的页面
+    same_title_item = [item for item in data if item["title"] == page_title and item["source"] == config["source"]]
+    if config.get("excludeExistingPages") and same_title_item:
+        return
+
+    # 获取分类并排除
+    page_categories = get_categories(page_title, config["index_url"])
+    exclude_set = set(c.strip().lower() for c in config["exclude_categories"])
+    for page_category in page_categories:
+        clean_category = page_category.replace("分类:", "").strip().lower()
+        # logging.info(f"{page_title} 分类: {clean_category}")
+        if clean_category in exclude_set:
+            logging.info(f"页面 {page_title} 位于排除的分类 {page_category} 下，跳过")
             return
 
-        # 获取分类并排除
-        page_categories = get_categories(page_title, config["index_url"])
-        exclude_set = set(c.strip().lower() for c in config["exclude_categories"])
-        for page_category in page_categories:
-            clean_category = page_category.replace("分类:", "").strip().lower()
-            if clean_category in exclude_set:
-                logging.info(f"页面 {page_title} 位于排除的分类 {page_category} 下，跳过")
-                return
+    # 请求页面
+    page_html = request_page(index_url, {"title": page_title})
+    if page_html == 404:
+        logging.warning(f"页面 {page_title} 不存在")
+        return
 
-        # 请求页面
-        page_html = request_page(index_url, {"title": page_title})
-        if page_html == 404:
-            logging.warning(f"页面 {page_title} 不存在")
-            return
+    # 获取页面信息
+    page_dict.update(get_info(page_html, index_url, page_title))
 
-        # 获取页面信息
-        page_dict.update(get_info(page_html, index_url, page_title))
+    # 处理输出
+    page_dict["data"] = {}
+    for output_format in config.get("output_format", []):
+        page_dict["data"][output_format] = process_html(page_html, config, output_format)
 
-        # 处理输出
-        page_dict["data"] = {}
-        for output_format in config.get("output_format", []):
-            page_dict["data"][output_format] = process_html(page_html, config, output_format)
+    # 更新 data
+    if same_title_item:
+        data.remove(same_title_item[0])
+    data.append(page_dict)
 
-        # 更新 data
-        if same_title_item:
-            data.remove(same_title_item[0])
-        data.append(page_dict)
-
-        # 写入文件
-        with open(output_path, 'w', encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
+    # 写入文件
+    with open(output_path, 'w', encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
 
 
 if __name__ == "__main__":
